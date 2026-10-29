@@ -1,0 +1,178 @@
+# Builds the Mac (.dmg) and Windows (Setup.exe) installers of MyPDF and publishes them as a release
+# of this repo, which is where MyPDF looks for updates (Settings > Check for Updates).
+#
+# It runs here because this repo is public: Actions minutes are free. The source stays in the
+# private repo mnasiruddinz/mypdf and is checked out with the SOURCE_TOKEN secret; only people with
+# write access to this repo can start a run (no pull_request trigger, and forks never get secrets).
+#
+# Start it after pushing the tag in mnasiruddinz/mypdf:
+#   gh workflow run build.yml --repo mnasiruddinz/mypdf-releases -f tag=v1.3.27
+# Each build uploads its installer straight to a draft release, which is published once both are
+# there: no artifacts, and MyPDF never sees a release missing a file.
+name: Build installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag in mnasiruddinz/mypdf to build, e.g. v1.3.27"
+        required: true
+
+run-name: Build ${{ inputs.tag }}
+
+env:
+  SOURCE_REPO: mnasiruddinz/mypdf
+  TAG: ${{ inputs.tag }}
+  GH_TOKEN: ${{ github.token }}
+
+permissions:
+  contents: write                             # the release in this repo
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check SOURCE_TOKEN
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          if [ -z "$SOURCE_TOKEN" ]; then
+            echo "::error::Add a SOURCE_TOKEN secret (fine-grained token with Contents: read and write on $SOURCE_REPO)."
+            exit 1
+          fi
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - name: Tag must match version.py
+        run: |
+          version=$(python3 -c "from version import VERSION; print(VERSION)")
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Tag $TAG does not match version.py ($version). Bump VERSION first."
+            exit 1
+          fi
+      - name: Release notes from CHANGELOG.md
+        run: |
+          python3 - <<'PY'
+          import os, re
+          v = os.environ["TAG"].lstrip("v")
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(rf"^## {re.escape(v)}\b.*?\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+          open("notes.md", "w", encoding="utf-8").write((m.group(1).strip() if m else f"MyPDF {v}") + "\n")
+          PY
+          cat notes.md
+      - name: Draft release
+        run: |
+          # a re-run finds the draft from the first try and keeps it
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 ||
+            gh release create "$TAG" --draft --repo "$GITHUB_REPOSITORY" --title "MyPDF ${TAG#v}" --notes-file notes.md
+
+  windows:
+    needs: draft
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build MyPDF.exe
+        run: |
+          python -m pip install -r requirements.txt pyinstaller
+          pyinstaller --noconfirm --clean MyPDF.spec
+      - name: Add Tesseract OCR
+        run: |
+          choco install tesseract -y --no-progress
+          python tools/bundle_tesseract_win.py dist/MyPDF
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          $version = python -c "from version import VERSION; print(VERSION)"
+          & $iscc "/DAppVersion=$version" installer\MyPDF.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build Microsoft Store package (.msix)
+        run: python tools/make_msix.py dist/MyPDF installer/Output
+      # Kept as a prerelease of the private source repo: upload it by hand in Partner Center > Packages.
+      - name: Keep the .msix as a store-v<version> prerelease in mnasiruddinz/mypdf
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          tag="store-v${TAG#v}"
+          gh release view "$tag" --repo "$SOURCE_REPO" > /dev/null 2>&1 ||
+            gh release create "$tag" --repo "$SOURCE_REPO" --prerelease --target "$(git rev-parse HEAD)" \
+              --title "MyPDF ${tag#store-v} (Microsoft Store)" \
+              --notes "Upload this .msix in Partner Center > Submission > Packages."
+          gh release upload "$tag" installer/Output/*.msix --repo "$SOURCE_REPO" --clobber
+      - name: Upload to the draft release
+        shell: bash
+        run: gh release upload "$TAG" installer/Output/*.exe --repo "$GITHUB_REPOSITORY" --clobber
+
+  mac:
+    needs: draft
+    runs-on: macos-14
+    # With these secrets the app is signed with the Developer ID and notarized by Apple,
+    # so Macs open it without a warning. MAC_CERT_P12 is the base64 of the exported .p12.
+    env:
+      MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+      MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Import Developer ID certificate
+        if: env.MAC_CERT_P12 != ''
+        run: |
+          KC="$RUNNER_TEMP/sign.keychain-db"
+          PW=$(uuidgen)
+          security create-keychain -p "$PW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$PW" "$KC"
+          echo "$MAC_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MAC_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KC"
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$PW" "$KC" > /dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          ID=$(security find-identity -v -p codesigning "$KC" | grep -o '"Developer ID Application: .*"' | head -1 | tr -d '"')
+          if [ -z "$ID" ]; then echo "::error::No Developer ID Application certificate in MAC_CERT_P12"; exit 1; fi
+          echo "Signing as: $ID"
+          echo "MAC_SIGN_IDENTITY=$ID" >> "$GITHUB_ENV"
+      - name: Build MyPDF.app and .dmg
+        run: |
+          brew install tesseract
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+          ./build_mac.sh
+      - name: Upload to the draft release
+        run: gh release upload "$TAG" dist/*.dmg --repo "$GITHUB_REPOSITORY" --clobber
+
+  release:
+    needs: [windows, mac]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release (MyPDF then offers the update)
+        run: |
+          assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          echo "$assets"
+          if ! echo "$assets" | grep -q '\.dmg$' || ! echo "$assets" | grep -q '\.exe$'; then
+            echo "::error::The draft release needs both the .dmg and the .exe."
+            exit 1
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
