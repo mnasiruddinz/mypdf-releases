@@ -7,6 +7,8 @@
 #
 # Start it after pushing the tag in mnasiruddinz/mypdf:
 #   gh workflow run build.yml --repo mnasiruddinz/mypdf-releases -f tag=v1.3.27
+# Untick mac or windows to build only the other one; running again later adds the missing installer
+# to the same release (MyPDF tells users of the other system that their installer isn't there yet).
 # Each build uploads its installer straight to a draft release, which is published once both are
 # there: no artifacts, and MyPDF never sees a release missing a file.
 name: Build installers
@@ -17,6 +19,14 @@ on:
       tag:
         description: "Tag in mnasiruddinz/mypdf to build, e.g. v1.3.27"
         required: true
+      windows:
+        description: "Build the Windows Setup.exe"
+        type: boolean
+        default: true
+      mac:
+        description: "Build the Mac .dmg (needs the signing secrets)"
+        type: boolean
+        default: true
 
 run-name: Build ${{ inputs.tag }}
 
@@ -71,6 +81,7 @@ jobs:
 
   windows:
     needs: draft
+    if: inputs.windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -118,6 +129,7 @@ jobs:
 
   mac:
     needs: draft
+    if: inputs.mac
     runs-on: macos-14
     # With these secrets the app is signed with the Developer ID and notarized by Apple,
     # so Macs open it without a warning. MAC_CERT_P12 is the base64 of the exported .p12.
@@ -137,8 +149,17 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Signing secrets are needed
+        run: |
+          # an unsigned .dmg would reach Mac users through auto-update: never publish one
+          if [ -z "$MAC_CERT_P12" ] || [ -z "$MAC_CERT_PASSWORD" ]; then
+            echo "::error::Add MAC_CERT_P12 and MAC_CERT_PASSWORD, or run with mac unticked."
+            exit 1
+          fi
+          if [ -z "$APPLE_APP_PASSWORD" ]; then
+            echo "::warning::No APPLE_APP_PASSWORD: the .dmg is signed but not notarized, so a downloaded copy shows a macOS warning. Run again with it to replace the .dmg."
+          fi
       - name: Import Developer ID certificate
-        if: env.MAC_CERT_P12 != ''
         run: |
           KC="$RUNNER_TEMP/sign.keychain-db"
           PW=$(uuidgen)
@@ -165,14 +186,17 @@ jobs:
 
   release:
     needs: [windows, mac]
+    if: ${{ !failure() && !cancelled() }}     # also when one of them was unticked (skipped)
     runs-on: ubuntu-latest
     steps:
       - name: Publish the release (MyPDF then offers the update)
         run: |
           assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
           echo "$assets"
-          if ! echo "$assets" | grep -q '\.dmg$' || ! echo "$assets" | grep -q '\.exe$'; then
-            echo "::error::The draft release needs both the .dmg and the .exe."
+          if ! echo "$assets" | grep -q -E '\.(dmg|exe)$'; then
+            echo "::error::The release has no installer."
             exit 1
           fi
+          echo "$assets" | grep -q '\.dmg$' || echo "::warning::No .dmg yet: Mac users are told their installer isn't there yet."
+          echo "$assets" | grep -q '\.exe$' || echo "::warning::No .exe yet: Windows users are told their installer isn't there yet."
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
