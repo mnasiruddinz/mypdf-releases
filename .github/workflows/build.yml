@@ -47,7 +47,7 @@ jobs:
           SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
         run: |
           if [ -z "$SOURCE_TOKEN" ]; then
-            echo "::error::Add a SOURCE_TOKEN secret (fine-grained token with Contents: read and write on $SOURCE_REPO)."
+            echo "::error::Add a SOURCE_TOKEN secret (fine-grained token with Contents: read on $SOURCE_REPO)."
             exit 1
           fi
       - uses: actions/checkout@v7
@@ -111,21 +111,23 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Build Microsoft Store package (.msix)
         run: python tools/make_msix.py dist/MyPDF installer/Output
-      # Kept as a prerelease of the private source repo: upload it by hand in Partner Center > Packages.
-      - name: Keep the .msix as a store-v<version> prerelease in mnasiruddinz/mypdf
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
-        run: |
-          tag="store-v${TAG#v}"
-          gh release view "$tag" --repo "$SOURCE_REPO" > /dev/null 2>&1 ||
-            gh release create "$tag" --repo "$SOURCE_REPO" --prerelease --target "$(git rev-parse HEAD)" \
-              --title "MyPDF ${tag#store-v} (Microsoft Store)" \
-              --notes "Upload this .msix in Partner Center > Submission > Packages."
-          gh release upload "$tag" installer/Output/*.msix --repo "$SOURCE_REPO" --clobber
       - name: Upload to the draft release
         shell: bash
         run: gh release upload "$TAG" installer/Output/*.exe --repo "$GITHUB_REPOSITORY" --clobber
+      # Kept as a draft release here (only people with write access see drafts, and MyPDF's update
+      # check never does). Upload it by hand in Partner Center > Submission > Packages.
+      - name: Keep the .msix as a draft release
+        shell: bash
+        run: |
+          title="MyPDF ${TAG#v} (Microsoft Store)"
+          find() { gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.name == \"$title\") | .tag_name" | head -1; }
+          tag=$(find)
+          if [ -z "$tag" ]; then
+            gh release create "store-v${TAG#v}" --draft --repo "$GITHUB_REPOSITORY" --title "$title" \
+              --notes "Upload this .msix in Partner Center > Submission > Packages."
+            tag=$(find)
+          fi
+          gh release upload "$tag" installer/Output/*.msix --repo "$GITHUB_REPOSITORY" --clobber
 
   mac:
     needs: draft
