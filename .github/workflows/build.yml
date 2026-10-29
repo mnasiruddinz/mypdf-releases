@@ -119,14 +119,10 @@ jobs:
       - name: Keep the .msix as a draft release
         shell: bash
         run: |
-          title="MyPDF ${TAG#v} (Microsoft Store)"
-          find() { gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.name == \"$title\") | .tag_name" | head -1; }
-          tag=$(find)
-          if [ -z "$tag" ]; then
-            gh release create "store-v${TAG#v}" --draft --repo "$GITHUB_REPOSITORY" --title "$title" \
+          tag="store-v${TAG#v}"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 ||
+            gh release create "$tag" --draft --repo "$GITHUB_REPOSITORY" --title "MyPDF ${TAG#v} (Microsoft Store)" \
               --notes "Upload this .msix in Partner Center > Submission > Packages."
-            tag=$(find)
-          fi
           gh release upload "$tag" installer/Output/*.msix --repo "$GITHUB_REPOSITORY" --clobber
 
   mac:
